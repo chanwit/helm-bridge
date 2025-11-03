@@ -46,26 +46,29 @@ Use the ConfigHub CLI to install the worker:
 
 ```bash
 cub worker install helm-bridge \
-  --image ghcr.io/chanwit/helm-bridge:latest
+  --image ghcr.io/chanwit/helm-bridge:latest \
+  -e CONFIGHUB_IN_CLUSTER_TARGET_NAME=my-cluster
 ```
 
 This will deploy the worker to your Kubernetes cluster and automatically configure credentials.
+The worker will automatically create a Target named `my-cluster` for units to set.
 
 ### Configuration
 
 The worker requires the following environment variables:
 
 ```bash
-CONFIGHUB_WORKER_ID       # Worker ID (automatically set by cub worker install)
-CONFIGHUB_WORKER_SECRET   # Worker secret (automatically set by cub worker install)
-CONFIGHUB_URL             # Optional: defaults to https://hub.confighub.com
+CONFIGHUB_WORKER_ID               # Worker ID (automatically set by cub worker install)
+CONFIGHUB_WORKER_SECRET           # Worker secret (automatically set by cub worker install)
+CONFIGHUB_URL                     # Optional: defaults to https://hub.confighub.com
+CONFIGHUB_IN_CLUSTER_TARGET_NAME  # Optional: target name to represent the cluster
 ```
 
 ## Development Testing
 
 ### Test with Kind Cluster
 
-Complete workflow to test the Helm Bridge locally:
+Complete workflow to test the Helm Bridge locally with Docker and KinD:
 
 ```bash
 # 1. Create a Kind cluster

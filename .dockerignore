@@ -1,0 +1,19 @@
+# Ignore build artifacts
+helm-bridge
+
+# Ignore git
+.git
+.gitignore
+
+# Ignore deps (reference only)
+.deps/
+
+# Ignore documentation
+README.md
+*.md
+
+# Ignore test files
+*_test.go
+
+# Ignore CI/CD
+.github/

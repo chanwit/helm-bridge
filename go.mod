@@ -4,11 +4,9 @@ go 1.25.1
 
 require (
 	github.com/confighub/sdk v0.0.0-20251103171302-801b998c8f60
-	github.com/gosimple/slug v1.15.0
 	helm.sh/helm/v3 v3.17.3
 	k8s.io/apimachinery v0.33.1
 	k8s.io/cli-runtime v0.33.1
-	k8s.io/client-go v0.33.1
 	sigs.k8s.io/controller-runtime v0.21.0
 	sigs.k8s.io/yaml v1.4.0
 )
@@ -80,6 +78,7 @@ require (
 	github.com/go-gorp/gorp/v3 v3.1.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
 	github.com/go-openapi/jsonreference v0.21.0 // indirect
@@ -98,6 +97,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
+	github.com/gosimple/slug v1.15.0 // indirect
 	github.com/gosimple/unidecode v1.0.1 // indirect
 	github.com/gosuri/uitable v0.0.4 // indirect
 	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79 // indirect
@@ -194,6 +194,8 @@ require (
 	go.opentelemetry.io/otel v1.38.0 // indirect
 	go.opentelemetry.io/otel/metric v1.38.0 // indirect
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/crypto v0.42.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/mod v0.27.0 // indirect
@@ -217,6 +219,7 @@ require (
 	k8s.io/api v0.33.1 // indirect
 	k8s.io/apiextensions-apiserver v0.33.1 // indirect
 	k8s.io/apiserver v0.33.1 // indirect
+	k8s.io/client-go v0.33.1 // indirect
 	k8s.io/component-base v0.33.1 // indirect
 	k8s.io/component-helpers v0.33.1 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect

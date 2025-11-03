@@ -8,9 +8,14 @@ import (
 	"os"
 
 	"github.com/confighub/sdk/worker"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 func main() {
+	// Initialize controller-runtime logger
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+
 	log.Printf("[INFO] Starting helm-bridge...")
 
 	// Create bridge dispatcher

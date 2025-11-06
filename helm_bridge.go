@@ -54,6 +54,15 @@ func parseObjects(data []byte) ([]*unstructured.Unstructured, error) {
 	return objects, nil
 }
 
+// objectsToYAML converts Kubernetes objects to YAML string
+func objectsToYAML(objects []*unstructured.Unstructured) (string, error) {
+	yamlData, err := ssautil.ObjectsToYAML(objects)
+	if err != nil {
+		return "", err
+	}
+	return yamlData, nil
+}
+
 // selectApplier chooses between HelmApplier and CLIUtilsSSA
 // Simple logic: Helm chart → HelmApplier, everything else → CLIUtilsSSA
 func (hb *HelmBridge) selectApplier(payload api.BridgePayload) (impl.K8sApplier, error) {
@@ -333,8 +342,33 @@ func (hb *HelmBridge) WatchForApply(wctx api.BridgeContext, payload api.BridgePa
 		), waitResult.Error)
 	}
 
-	// Delegate to base implementation for final status handling
-	return hb.KubernetesBridgeWorker.WatchForApply(wctx, payload)
+	// Build final result from waitResult (don't delegate to base - it would re-poll all objects including hooks)
+	yamlData, err := objectsToYAML(waitResult.LiveObjects)
+	if err != nil {
+		log.Log.Error(err, "Failed to convert objects to YAML")
+		return lib.SafeSendStatus(wctx, newActionResult(
+			api.ActionStatusFailed,
+			api.ActionResultApplyWaitFailed,
+			fmt.Sprintf("Failed to convert objects to YAML: %v", err),
+		), err)
+	}
+
+	// Log changeset info
+	changesetCount := 0
+	if waitResult.ResourceSet != nil {
+		changesetCount = len(waitResult.ResourceSet.GetEntries())
+	}
+	log.Log.Info("✅ Resources are ready", "changeset_entries", changesetCount, "liveObjects", len(waitResult.LiveObjects))
+
+	status := newActionResult(
+		api.ActionStatusCompleted,
+		api.ActionResultApplyCompleted,
+		fmt.Sprintf("Applied %d resources successfully at %s", len(waitResult.LiveObjects), time.Now().Format(time.RFC3339)),
+	)
+	status.LiveState = []byte(yamlData)
+
+	wctx.SendStatus(status)
+	return nil
 }
 
 // Override WatchForDestroy to use custom applier selection
@@ -391,8 +425,23 @@ func (hb *HelmBridge) WatchForDestroy(wctx api.BridgeContext, payload api.Bridge
 		), waitResult.Error)
 	}
 
-	// Delegate to base implementation for final status handling
-	return hb.KubernetesBridgeWorker.WatchForDestroy(wctx, payload)
+	// Build final result from waitResult (don't delegate to base - it would re-poll all objects including hooks)
+	// Log changeset info
+	changesetCount := 0
+	if waitResult.ResourceSet != nil {
+		changesetCount = len(waitResult.ResourceSet.GetEntries())
+	}
+	log.Log.Info("✅ Resources destroyed successfully", "changeset_entries", changesetCount)
+
+	status := newActionResult(
+		api.ActionStatusCompleted,
+		api.ActionResultDestroyCompleted,
+		fmt.Sprintf("Destroyed %d resources successfully at %s", changesetCount, time.Now().Format(time.RFC3339)),
+	)
+	status.LiveState = nil // No live state after destroy
+
+	wctx.SendStatus(status)
+	return nil
 }
 
 // newActionResult creates an ActionResult with common fields

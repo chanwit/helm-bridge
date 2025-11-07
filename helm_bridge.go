@@ -63,26 +63,27 @@ func objectsToYAML(objects []*unstructured.Unstructured) (string, error) {
 	return yamlData, nil
 }
 
-// selectApplier chooses between HelmApplier and CLIUtilsSSA
-// Simple logic: Helm chart → HelmApplier, everything else → CLIUtilsSSA
+// selectApplier chooses between HelmApplier, CRDsApplier, and CLIUtilsSSA
+// Logic: CRD-only resources → CRDsApplier, Helm chart → HelmApplier, everything else → CLIUtilsSSA
 func (hb *HelmBridge) selectApplier(payload api.BridgePayload) (impl.K8sApplier, error) {
-	// Check if this is a Helm chart
-	if !helmutils.IsHelmChart(payload.UnitLabels) {
-		log.Log.Info("Using CLIUtilsSSA", "unitSlug", payload.UnitSlug)
-		return hb.createCLIUtilsApplier(payload)
-	}
-
-	// Check if all resources are CRDs (exception case)
+	// Parse objects first to check if they're all CRDs
 	objects, err := parseObjects(payload.Data)
 	if err != nil {
 		log.Log.Info("Failed to parse objects, using CLIUtilsSSA", "error", err)
 		return hb.createCLIUtilsApplier(payload)
 	}
 
+	// Check if all resources are CRDs - use specialized CRDsApplier
 	if allResourcesAreCRDs(objects) {
-		log.Log.Info("Helm chart with only CRDs, using CLIUtilsSSA",
-			"chart", payload.UnitLabels["HelmChart"],
-			"crdCount", len(objects))
+		log.Log.Info("All resources are CRDs, using CRDsApplier",
+			"crdCount", len(objects),
+			"unitSlug", payload.UnitSlug)
+		return hb.createCRDsApplier(payload)
+	}
+
+	// Check if this is a Helm chart
+	if !helmutils.IsHelmChart(payload.UnitLabels) {
+		log.Log.Info("Using CLIUtilsSSA", "unitSlug", payload.UnitSlug)
 		return hb.createCLIUtilsApplier(payload)
 	}
 
@@ -123,6 +124,31 @@ func (hb *HelmBridge) createHelmApplier(payload api.BridgePayload) (impl.K8sAppl
 		return nil, err
 	}
 	return NewHelmApplier(config)
+}
+
+// createCRDsApplier creates a CRDsApplier wrapped in an adapter
+func (hb *HelmBridge) createCRDsApplier(payload api.BridgePayload) (impl.K8sApplier, error) {
+	workerParams, _, err := parseTargetParams(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse timeout
+	timeout := impl.DefaultTimeout
+	if workerParams.WaitTimeout != "" {
+		if t, parseErr := time.ParseDuration(workerParams.WaitTimeout); parseErr == nil {
+			timeout = t
+		}
+	}
+
+	// Create the native CRDsApplier
+	crdsApplier, err := NewCRDsApplier(timeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CRDsApplier: %w", err)
+	}
+
+	// Wrap it in an adapter that implements impl.K8sApplier
+	return NewCRDsApplierAdapter(crdsApplier), nil
 }
 
 // createApplierConfig creates impl.ApplierConfig from payload
@@ -358,7 +384,7 @@ func (hb *HelmBridge) WatchForApply(wctx api.BridgeContext, payload api.BridgePa
 	if waitResult.ResourceSet != nil {
 		changesetCount = len(waitResult.ResourceSet.GetEntries())
 	}
-	log.Log.Info("✅ Resources are ready", "changeset_entries", changesetCount, "liveObjects", len(waitResult.LiveObjects))
+	log.Log.Info("✅ Resources are ready - operation complete", "changeset_entries", changesetCount, "liveObjects", len(waitResult.LiveObjects))
 
 	status := newActionResult(
 		api.ActionStatusCompleted,
@@ -408,7 +434,7 @@ func (hb *HelmBridge) WatchForDestroy(wctx api.BridgeContext, payload api.Bridge
 		), err)
 	}
 
-	// Parse timeout
+	// Parse timeout - use longer timeout for CRDs
 	timeout := impl.DefaultTimeout
 	if workerParams.WaitTimeout != "" {
 		if t, parseErr := time.ParseDuration(workerParams.WaitTimeout); parseErr == nil {
@@ -416,8 +442,26 @@ func (hb *HelmBridge) WatchForDestroy(wctx api.BridgeContext, payload api.Bridge
 		}
 	}
 
+	// CRDs often take longer to delete due to finalizers and dependent resources
+	// Increase timeout for CRD-only resources
+	if allResourcesAreCRDs(objects) {
+		crdTimeout := timeout * 3 // 3x the normal timeout
+		if crdTimeout < 15*time.Minute {
+			crdTimeout = 15 * time.Minute // Minimum 15 minutes for CRDs
+		}
+		log.Log.Info("🔧 Using extended timeout for CRD deletion",
+			"standardTimeout", timeout,
+			"crdTimeout", crdTimeout,
+			"crdCount", len(objects))
+		timeout = crdTimeout
+	}
+
 	waitResult := applier.WaitForDestroy(wctx.Context(), objects, timeout)
 	if waitResult.Error != nil {
+		// Check if error is due to context cancellation (which might be normal)
+		if err := wctx.Context().Err(); err != nil {
+			log.Log.Info("⚠️ Destroy watcher context ended", "reason", err.Error())
+		}
 		return lib.SafeSendStatus(wctx, newActionResult(
 			api.ActionStatusFailed,
 			api.ActionResultDestroyWaitFailed,
@@ -431,7 +475,7 @@ func (hb *HelmBridge) WatchForDestroy(wctx api.BridgeContext, payload api.Bridge
 	if waitResult.ResourceSet != nil {
 		changesetCount = len(waitResult.ResourceSet.GetEntries())
 	}
-	log.Log.Info("✅ Resources destroyed successfully", "changeset_entries", changesetCount)
+	log.Log.Info("✅ Resources destroyed successfully - operation complete", "changeset_entries", changesetCount)
 
 	status := newActionResult(
 		api.ActionStatusCompleted,

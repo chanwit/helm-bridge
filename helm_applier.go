@@ -47,6 +47,7 @@ type HelmApplier struct {
 	lastLiveObjects         []*unstructured.Unstructured
 	pendingResources        kube.ResourceList // Resources waiting to be ready
 	pendingDeletedResources kube.ResourceList // Non-namespace resources waiting to be fully deleted (Destroy → WaitForDestroy pattern)
+	pendingWebhooks         kube.ResourceList // Webhook resources waiting to be deleted after regular resources (Destroy → WaitForDestroy pattern)
 	pendingNamespaces       kube.ResourceList // Namespace resources waiting to be deleted (Destroy → WaitForDestroy pattern)
 	isInstallMode           bool              // True if last Apply was install
 	isUpgradeMode           bool              // True if last Apply was upgrade
@@ -488,12 +489,20 @@ func (a *HelmApplier) Destroy(ctx context.Context, objects []*unstructured.Unstr
 	// Get release history
 	rels, err := a.actionConfig.Releases.History(helmMeta.ReleaseName)
 	if err != nil {
-		log.Log.Error(err, "❌ Release not found", "release", helmMeta.ReleaseName)
-		return impl.DestroyResult{Error: fmt.Errorf("release not found: %s: %w", helmMeta.ReleaseName, err)}
+		log.Log.Info("✅ Release not found - nothing to destroy", "release", helmMeta.ReleaseName)
+		return impl.DestroyResult{
+			ResourceSet: impl.NewSimpleResourceSet(),
+			LiveState:   nil,
+			Error:       nil,
+		}
 	}
 	if len(rels) < 1 {
-		log.Log.Error(nil, "❌ Release history empty", "release", helmMeta.ReleaseName)
-		return impl.DestroyResult{Error: fmt.Errorf("release %s not found", helmMeta.ReleaseName)}
+		log.Log.Info("✅ Release history empty - nothing to destroy", "release", helmMeta.ReleaseName)
+		return impl.DestroyResult{
+			ResourceSet: impl.NewSimpleResourceSet(),
+			LiveState:   nil,
+			Error:       nil,
+		}
 	}
 
 	// Get latest release
@@ -502,8 +511,12 @@ func (a *HelmApplier) Destroy(ctx context.Context, objects []*unstructured.Unstr
 
 	// Check if already uninstalled
 	if rel.Info.Status == release.StatusUninstalled {
-		log.Log.Info("⚠️ Release already uninstalled", "release", helmMeta.ReleaseName)
-		return impl.DestroyResult{Error: fmt.Errorf("release %s already uninstalled", helmMeta.ReleaseName)}
+		log.Log.Info("✅ Release already uninstalled - nothing to destroy", "release", helmMeta.ReleaseName)
+		return impl.DestroyResult{
+			ResourceSet: impl.NewSimpleResourceSet(),
+			LiveState:   nil,
+			Error:       nil,
+		}
 	}
 
 	log.Log.Info("📦 Found release for deletion",
@@ -526,9 +539,9 @@ func (a *HelmApplier) Destroy(ctx context.Context, objects []*unstructured.Unstr
 		}
 	}
 
-	// Delete non-namespace resources (using optimized pattern from helm-uninstall)
+	// Delete regular resources (using optimized pattern from helm-uninstall)
 	log.Log.Info("🗑️ Deleting release resources")
-	deletedResources, namespaceResources, kept, errs := a.deleteReleaseOptimized(rel, "background")
+	deletedResources, webhookResources, namespaceResources, kept, errs := a.deleteReleaseOptimized(rel, "background")
 	if errs != nil {
 		log.Log.Error(fmt.Errorf("%v", errs), "❌ Failed to delete resources")
 		return impl.DestroyResult{Error: fmt.Errorf("failed to delete resources: %v", errs)}
@@ -537,9 +550,9 @@ func (a *HelmApplier) Destroy(ctx context.Context, objects []*unstructured.Unstr
 	if kept != "" {
 		log.Log.Info("📌 Resources kept due to policy", "kept", kept)
 	}
-	log.Log.V(1).Info("✅ Resources deleted", "deletedCount", len(deletedResources), "namespacesDeferred", len(namespaceResources))
+	log.Log.V(1).Info("✅ Resources deleted", "deletedCount", len(deletedResources), "webhooksDeferred", len(webhookResources), "namespacesDeferred", len(namespaceResources))
 
-	// Build ResourceSet (include both deleted resources and pending namespaces)
+	// Build ResourceSet (include deleted resources and pending webhooks/namespaces)
 	simpleResourceSet := impl.NewSimpleResourceSet()
 	for _, info := range deletedResources {
 		simpleResourceSet.Add(impl.SimpleResourceSetEntry{
@@ -547,6 +560,15 @@ func (a *HelmApplier) Destroy(ctx context.Context, objects []*unstructured.Unstr
 			Namespace: info.Namespace,
 			Kind:      info.Mapping.GroupVersionKind.Kind,
 			Action:    "Deleted",
+		})
+	}
+	// Add webhook resources with "Deleting" status (will be deleted in WaitForDestroy)
+	for _, info := range webhookResources {
+		simpleResourceSet.Add(impl.SimpleResourceSetEntry{
+			Name:      info.Name,
+			Namespace: info.Namespace,
+			Kind:      info.Mapping.GroupVersionKind.Kind,
+			Action:    "Deleting", // Will be updated to "Deleted" in WaitForDestroy
 		})
 	}
 	// Add namespace resources with "Deleting" status (will be deleted in WaitForDestroy)
@@ -559,14 +581,16 @@ func (a *HelmApplier) Destroy(ctx context.Context, objects []*unstructured.Unstr
 		})
 	}
 
-	// Store deleted resources and namespace resources for WaitForDestroy (store ResourceList directly to avoid conversion bugs)
+	// Store deleted resources, webhook resources, and namespace resources for WaitForDestroy
 	a.lastResourceSet = simpleResourceSet
-	a.pendingDeletedResources = deletedResources // Non-namespace resources to wait for deletion
-	a.pendingNamespaces = namespaceResources     // Store the built ResourceList directly - no conversion needed!
+	a.pendingDeletedResources = deletedResources // Regular resources to wait for deletion
+	a.pendingWebhooks = webhookResources         // Webhooks to delete after regular resources
+	a.pendingNamespaces = namespaceResources     // Namespaces to delete after webhooks
 
-	log.Log.Info("✅ Destroy initiated (namespace deletion deferred to WaitForDestroy)",
+	log.Log.Info("✅ Destroy initiated (webhook and namespace deletion deferred to WaitForDestroy)",
 		"release", helmMeta.ReleaseName,
 		"deletedCount", len(deletedResources),
+		"webhooksDeferred", len(webhookResources),
 		"namespacesDeferred", len(namespaceResources))
 
 	return impl.DestroyResult{
@@ -634,6 +658,70 @@ func (a *HelmApplier) WaitForDestroy(ctx context.Context, objects []*unstructure
 				return impl.WaitResult{Error: fmt.Errorf("timeout waiting for non-namespace resource deletion: %w", err)}
 			}
 			log.Log.V(1).Info("✅ Non-namespace resources fully deleted")
+		}
+	}
+
+	// Handle case where WaitForDestroy is called on a fresh applier instance for webhooks
+	// (state was lost between Destroy and WaitForDestroy calls)
+	if len(a.pendingWebhooks) == 0 && a.lastResourceSet == nil {
+		log.Log.Info("⚠️ Fresh applier instance detected, extracting webhooks from input objects")
+		// Extract webhook resources from input objects
+		webhookObjs := []*unstructured.Unstructured{}
+		for _, obj := range objects {
+			kind := obj.GetKind()
+			if kind == "ValidatingWebhookConfiguration" || kind == "MutatingWebhookConfiguration" {
+				webhookObjs = append(webhookObjs, obj)
+			}
+		}
+
+		if len(webhookObjs) > 0 {
+			// Build ResourceList for webhook deletion
+			yamlStr, yamlErr := objectsToManifestString(webhookObjs)
+			if yamlErr != nil {
+				log.Log.Error(yamlErr, "❌ Failed to convert webhook objects to YAML")
+				return impl.WaitResult{Error: fmt.Errorf("failed to convert webhook objects to YAML: %w", yamlErr)}
+			}
+
+			var buildErr error
+			a.pendingWebhooks, buildErr = a.actionConfig.KubeClient.Build(
+				strings.NewReader(yamlStr),
+				false,
+			)
+			if buildErr != nil {
+				log.Log.Error(buildErr, "❌ Failed to build webhook ResourceList from objects")
+				return impl.WaitResult{Error: fmt.Errorf("failed to build webhook ResourceList: %w", buildErr)}
+			}
+			log.Log.Info("✅ Rebuilt webhook ResourceList from input objects", "count", len(a.pendingWebhooks))
+		}
+	}
+
+	// Delete webhooks after regular resources are fully deleted but before namespaces
+	// This ensures CRDs (if deleted separately) can complete their cleanup before webhooks are removed
+	if len(a.pendingWebhooks) > 0 {
+		log.Log.Info("🗑️ Deleting webhooks", "count", len(a.pendingWebhooks))
+
+		// Delete webhooks using FOREGROUND propagation
+		var deleteErrs []error
+		if kubeClient, ok := a.actionConfig.KubeClient.(kube.InterfaceDeletionPropagation); ok {
+			_, deleteErrs = kubeClient.DeleteWithPropagationPolicy(a.pendingWebhooks, metav1.DeletePropagationForeground)
+		} else {
+			_, deleteErrs = a.actionConfig.KubeClient.Delete(a.pendingWebhooks)
+		}
+
+		// Check for deletion errors
+		if len(deleteErrs) > 0 {
+			log.Log.Error(fmt.Errorf("%v", deleteErrs), "❌ Failed to delete webhooks", "errorCount", len(deleteErrs))
+			return impl.WaitResult{Error: fmt.Errorf("failed to delete webhooks: %v", deleteErrs)}
+		}
+
+		// Wait for webhook deletion
+		if kubeClient, ok := a.actionConfig.KubeClient.(kube.InterfaceExt); ok {
+			log.Log.Info("⏳ Waiting for webhook deletion", "timeout", timeout)
+			if err := kubeClient.WaitForDelete(a.pendingWebhooks, timeout); err != nil {
+				log.Log.Error(err, "❌ Error waiting for webhook deletion")
+				return impl.WaitResult{Error: fmt.Errorf("timeout waiting for webhook deletion: %w", err)}
+			}
+			log.Log.V(1).Info("✅ Webhooks deleted successfully")
 		}
 	}
 
@@ -819,15 +907,22 @@ func (a *HelmApplier) performInstall(
 		return impl.ApplyResult{Error: fmt.Errorf("failed to set metadata: %w", err)}
 	}
 
-	// Create resources
+	// Create resources (ignore if already exist - idempotent operation)
 	log.Log.Info("📦 Installing resources", "count", len(resources))
 	if _, err := a.actionConfig.KubeClient.Create(resources); err != nil {
-		log.Log.Error(err, "❌ Failed to create resources")
-		rel.SetStatus(release.StatusFailed, fmt.Sprintf("failed to create resources: %s", err))
-		a.actionConfig.Releases.Update(rel)
-		return impl.ApplyResult{Error: fmt.Errorf("failed to create resources: %w", err)}
+		// Check if all errors are "already exists" errors (idempotent - desired state achieved)
+		if !strings.Contains(err.Error(), "already exists") {
+			// There are non-idempotent errors
+			log.Log.Error(err, "❌ Failed to create resources")
+			rel.SetStatus(release.StatusFailed, fmt.Sprintf("failed to create resources: %s", err))
+			a.actionConfig.Releases.Update(rel)
+			return impl.ApplyResult{Error: fmt.Errorf("failed to create resources: %w", err)}
+		}
+		// All resources already exist - this is fine (idempotent operation)
+		log.Log.Info("✅ Resources already exist - desired state achieved", "count", len(resources))
+	} else {
+		log.Log.V(1).Info("✅ Resources created successfully", "count", len(resources))
 	}
-	log.Log.V(1).Info("✅ Resources created successfully", "count", len(resources))
 
 	// Store state for WaitForApply (non-blocking pattern)
 	a.lastRelease = rel
@@ -1065,16 +1160,16 @@ func (a *HelmApplier) createNamespaces(namespaceManifests []releaseutil.Manifest
 	return nil
 }
 
-// deleteReleaseOptimized deletes non-namespace resources and returns namespace resources
+// deleteReleaseOptimized deletes regular resources and returns webhook and namespace resources for deferred deletion
 func (a *HelmApplier) deleteReleaseOptimized(
 	rel *release.Release,
 	deletionPropagation string,
-) (deletedResources kube.ResourceList, namespaceResources kube.ResourceList, kept string, errs []error) {
+) (deletedResources kube.ResourceList, webhookResources kube.ResourceList, namespaceResources kube.ResourceList, kept string, errs []error) {
 	// Split manifests
 	manifests := releaseutil.SplitManifests(rel.Manifest)
 	_, sortedManifests, err := releaseutil.SortManifests(manifests, nil, releaseutil.UninstallOrder)
 	if err != nil {
-		return nil, nil, rel.Manifest, []error{fmt.Errorf("corrupted release record: %w", err)}
+		return nil, nil, nil, rel.Manifest, []error{fmt.Errorf("corrupted release record: %w", err)}
 	}
 
 	// Filter resources with helm.sh/resource-policy: keep
@@ -1087,26 +1182,39 @@ func (a *HelmApplier) deleteReleaseOptimized(
 	}
 	kept = keptBuilder.String()
 
-	// Separate namespaces from other resources
+	// Separate resources into: regular, webhooks, and namespaces
+	// Webhooks must be deleted after regular resources but before namespaces
+	// because CRDs (deleted separately) may need to call webhooks during their cleanup
 	var namespaceManifests []releaseutil.Manifest
-	var nonNamespaceManifests []releaseutil.Manifest
+	var webhookManifests []releaseutil.Manifest
+	var regularManifests []releaseutil.Manifest
 	for _, manifest := range manifestsToDelete {
-		if manifest.Head != nil && manifest.Head.Kind == "Namespace" {
-			namespaceManifests = append(namespaceManifests, manifest)
+		if manifest.Head != nil {
+			switch manifest.Head.Kind {
+			case "Namespace":
+				namespaceManifests = append(namespaceManifests, manifest)
+			case "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration":
+				webhookManifests = append(webhookManifests, manifest)
+			default:
+				regularManifests = append(regularManifests, manifest)
+			}
 		} else {
-			nonNamespaceManifests = append(nonNamespaceManifests, manifest)
+			regularManifests = append(regularManifests, manifest)
 		}
 	}
 
 	if len(namespaceManifests) > 0 {
 		log.Log.Info("📋 Found namespaces - deferring deletion", "count", len(namespaceManifests))
 	}
+	if len(webhookManifests) > 0 {
+		log.Log.Info("📋 Found webhooks - deferring deletion", "count", len(webhookManifests))
+	}
 
-	// Delete non-namespace resources first
-	if len(nonNamespaceManifests) > 0 {
-		log.Log.Info("🗑️ Preparing to delete resources (excluding namespaces)", "count", len(nonNamespaceManifests))
+	// Delete regular resources first (excluding webhooks and namespaces)
+	if len(regularManifests) > 0 {
+		log.Log.Info("🗑️ Preparing to delete resources (excluding webhooks and namespaces)", "count", len(regularManifests))
 		var regularBuilder strings.Builder
-		for i, manifest := range nonNamespaceManifests {
+		for i, manifest := range regularManifests {
 			if i > 0 {
 				regularBuilder.WriteString("\n---\n")
 			}
@@ -1116,10 +1224,10 @@ func (a *HelmApplier) deleteReleaseOptimized(
 		resources, err := a.actionConfig.KubeClient.Build(strings.NewReader(regularBuilder.String()), false)
 		if err != nil {
 			log.Log.Error(err, "❌ Unable to build resources for deletion")
-			return nil, nil, kept, []error{fmt.Errorf("unable to build resources: %w", err)}
+			return nil, nil, nil, kept, []error{fmt.Errorf("unable to build resources: %w", err)}
 		}
 
-		log.Log.Info("🗑️ Deleting resources (excluding namespaces)", "count", len(resources), "policy", deletionPropagation)
+		log.Log.Info("🗑️ Deleting resources (excluding webhooks and namespaces)", "count", len(resources), "policy", deletionPropagation)
 
 		policy := a.parseDeletionPropagation(deletionPropagation)
 		if kubeClient, ok := a.actionConfig.KubeClient.(kube.InterfaceDeletionPropagation); ok {
@@ -1137,7 +1245,25 @@ func (a *HelmApplier) deleteReleaseOptimized(
 		deletedResources = resources
 	}
 
-	// Build namespace resources for later deletion
+	// Build webhook resources for later deletion (after regular resources)
+	if len(webhookManifests) > 0 {
+		var webhookBuilder strings.Builder
+		for i, manifest := range webhookManifests {
+			if i > 0 {
+				webhookBuilder.WriteString("\n---\n")
+			}
+			webhookBuilder.WriteString(manifest.Content)
+		}
+
+		whResources, err := a.actionConfig.KubeClient.Build(strings.NewReader(webhookBuilder.String()), false)
+		if err != nil {
+			log.Log.Error(err, "❌ Unable to build webhook resources for deletion")
+			return nil, nil, nil, kept, []error{fmt.Errorf("unable to build webhook resources: %w", err)}
+		}
+		webhookResources = whResources
+	}
+
+	// Build namespace resources for later deletion (after webhooks)
 	if len(namespaceManifests) > 0 {
 		var nsBuilder strings.Builder
 		for i, manifest := range namespaceManifests {
@@ -1150,12 +1276,12 @@ func (a *HelmApplier) deleteReleaseOptimized(
 		nsResources, err := a.actionConfig.KubeClient.Build(strings.NewReader(nsBuilder.String()), false)
 		if err != nil {
 			log.Log.Error(err, "❌ Unable to build namespace resources for deletion")
-			return nil, nil, kept, []error{fmt.Errorf("unable to build namespace resources: %w", err)}
+			return nil, nil, nil, kept, []error{fmt.Errorf("unable to build namespace resources: %w", err)}
 		}
 		namespaceResources = nsResources
 	}
 
-	return deletedResources, namespaceResources, kept, errs
+	return deletedResources, webhookResources, namespaceResources, kept, errs
 }
 
 // filterManifestsToKeep filters manifests with helm.sh/resource-policy: keep

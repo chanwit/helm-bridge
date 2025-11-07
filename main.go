@@ -28,11 +28,32 @@ func main() {
 	}
 	bridgeDispatcher.RegisterBridge(bridge)
 
+	// Get configuration from environment
+	workerID := os.Getenv("CONFIGHUB_WORKER_ID")
+	workerSecret := os.Getenv("CONFIGHUB_WORKER_SECRET")
+	configHubURL := os.Getenv("CONFIGHUB_URL")
+	if configHubURL == "" {
+		configHubURL = "https://hub.confighub.com"
+	}
+
+	// Log connection details (masking the secret)
+	maskedSecret := ""
+	if len(workerSecret) > 8 {
+		maskedSecret = workerSecret[:8] + "..."
+	} else if workerSecret != "" {
+		maskedSecret = "***"
+	}
+
+	log.Printf("[INFO] Connecting to ConfigHub:")
+	log.Printf("  - URL: %s", configHubURL)
+	log.Printf("  - Worker ID: %s", workerID)
+	log.Printf("  - Worker Secret: %s", maskedSecret)
+
 	// Create connector with ConfigHub credentials
 	connector, err := worker.NewConnector(worker.ConnectorOptions{
-		WorkerID:         os.Getenv("CONFIGHUB_WORKER_ID"),
-		WorkerSecret:     os.Getenv("CONFIGHUB_WORKER_SECRET"),
-		ConfigHubURL:     os.Getenv("CONFIGHUB_URL"),
+		WorkerID:         workerID,
+		WorkerSecret:     workerSecret,
+		ConfigHubURL:     configHubURL,
 		BridgeDispatcher: &bridgeDispatcher,
 	})
 

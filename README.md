@@ -78,17 +78,20 @@ kind create cluster
 cub auth login
 
 # 3. Create a worker
-cub worker create my-worker
+cub worker create dev-worker
 
 # 4. Build and load the Docker image into Kind
 make docker
-kind load docker-image ghcr.io/chanwit/helm-bridge
+kind load docker-image ghcr.io/chanwit/helm-bridge:latest
+
 
 # 5. Install the worker to Kubernetes
-cub worker install my-worker \
-  --image=ghcr.io/chanwit/helm-bridge \
+export CONFIGHUB_URL=$(cub context get --json | jq .coordinate.serverURL -r)
+
+cub worker install dev-worker \
+  --image=ghcr.io/chanwit/helm-bridge:latest \
   --image-pull-policy=IfNotPresent \
-  -e CONFIGHUB_URL=http://172.17.0.1:9090 \
+  -e CONFIGHUB_URL=$CONFIGHUB_URL \
   -e CONFIGHUB_IN_CLUSTER_TARGET_NAME=dev-cluster \
   --export --include-secret | kubectl apply -f -
 
@@ -100,10 +103,10 @@ cub helm install \
   prometheus-community/kube-prometheus-stack
 
 # 7. Set the target for the unit
-cub unit set-target prometheus dev-cluster
+cub unit set-target dev-cluster --where "Labels.HelmChart = 'kube-prometheus-stack'"
 
 # 8. Apply the unit
-cub unit apply prometheus
+cub unit apply --where "Labels.HelmChart = 'kube-prometheus-stack'"
 ```
 
 ### Verify Helm Release
